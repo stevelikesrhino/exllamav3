@@ -176,40 +176,37 @@ class MoeCpuTuning:
 TUNING = MoeCpuTuning()
 ext.exl3_moe_cpu_set_memops(TUNING.memops)
 
-# Host placement is per process: planned for the first started host's worker count and kept
-# for later hosts (MTP head, draft model, reload). Workers spawned after it restore the
+# Host placement is per process: reserve LPs outside the largest pool started so far,
+# including when a smaller MTP/draft pool starts before the main model. Workers restore the
 # pre-pin mask (_HOST_ORIG_CPUS) so their pool can pin outside the host's LPs
 _HOST_AFFINITY_THREADS: int | None = None
 _HOST_ORIG_CPUS: list[int] | None = None
 
 
 def _apply_host_affinity(threads: int, host_cores: int):
-    """Confine the host process to the CPUs the worker pool leaves free. Never raises: an OS
-    failure leaves the host unpinned with a notice."""
+    """Confine the host process to CPUs all worker pools leave free. An OS failure leaves
+    the existing affinity unchanged with a notice."""
     global _HOST_AFFINITY_THREADS, _HOST_ORIG_CPUS
-    if _HOST_AFFINITY_THREADS is not None:
-        if threads > _HOST_AFFINITY_THREADS:
-            print(f" -- CPU MoE host affinity: placement planned for {_HOST_AFFINITY_THREADS} workers, "
-                  f"kept for a {threads}-thread worker")
+    if _HOST_AFFINITY_THREADS is not None and threads <= _HOST_AFFINITY_THREADS:
         return
-    _HOST_AFFINITY_THREADS = threads
     order, n_phys = ext.exl3_moe_cpu_core_order()
     cpus = plan_host_cpus(order, n_phys, threads, host_cores)
     if cpus is None:
         if host_cores > 0 and n_phys:
             print(" -- CPU MoE host affinity: no LP free of workers in one processor group; "
-                  "host threads left unpinned")
+                  "host affinity unchanged")
         return
     try:
-        orig = process_cpus()
+        orig = _HOST_ORIG_CPUS if _HOST_ORIG_CPUS is not None else process_cpus()
     except OSError as e:
-        print(f" !! CPU MoE host affinity: {e}; host threads left unpinned")
+        print(f" !! CPU MoE host affinity: {e}; host affinity unchanged")
         return
     err = apply_process_affinity(cpus)
     if err is not None:
-        print(f" !! CPU MoE host affinity: {err}; host threads left unpinned")
+        print(f" !! CPU MoE host affinity: {err}; host affinity unchanged")
         return
     _HOST_ORIG_CPUS = orig
+    _HOST_AFFINITY_THREADS = threads
     print(f" -- CPU MoE host affinity: host on LPs {[enc & 0xFFFF for enc in cpus]}")
 
 

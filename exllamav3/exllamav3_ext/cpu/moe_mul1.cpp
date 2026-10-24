@@ -57,7 +57,10 @@
 // No generic lambdas inside target-attributed functions (GCC does not let lambdas inherit the
 // target), hence the recursive-template row unrolling.
 
-namespace { std::atomic<bool> g_prof_enabled { false }; }
+namespace {
+std::atomic<bool> g_prof_enabled { false };
+std::atomic<int64_t> g_prof_rows { 0 }, g_prof_wide_rows { 0 };
+}
 
 void exl3_moe_cpu_set_prof(bool enabled)
 {
@@ -474,12 +477,15 @@ int quantize_row(const float* dst, int k, PreparedIn& p, int r, int slot)
     int32_t s;
     if (g_isa != Isa::Scalar)
     {
+        const bool prof = g_prof_enabled.load(std::memory_order_relaxed);
+        if (prof) g_prof_rows.fetch_add(1, std::memory_order_relaxed);
         const float amax = row_absmax_avx2(dst, k);
         const int zeros = quantize_row_avx2(dst, splat, splat_dup, k, amax, q, s);
         if (g_wide_rows && amax > 0.0f && zeros * WIDE_ZERO_DIV > k)
         {
             quantize_row_wide_avx2(dst, splat, splat_dup, k, amax, p.q + slot, p.sum_x8 + slot);
             p.wide[r] = 1;
+            if (prof) g_prof_wide_rows.fetch_add(1, std::memory_order_relaxed);
             return slot + 2;
         }
     }
@@ -1090,7 +1096,7 @@ constexpr bool byte_pair_ok()
 
 template <int bits, bool hb, int row>
 M1_TARGET_VBMI
-inline __m512i gather_row_bytes(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
+M1_ALWAYS_INLINE __m512i gather_row_bytes(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
 {
     alignas(64) static constexpr auto bidx = make_row_byte_indices<bits, hb, row>();
     const __m512i idx = _mm512_load_si512(bidx.data());
@@ -1121,7 +1127,7 @@ inline __m512i gather_row_bytes(__m512i p0, __m512i p1, __m512i p2, __m512i p3)
 // delta = 0 extracts `row` itself; delta = bits extracts row+1 from row's gathered bytes
 template <int bits, bool hb, int row, int delta>
 M1_TARGET_VBMI
-inline __m512i shift_mask_row(__m512i g)
+M1_ALWAYS_INLINE __m512i shift_mask_row(__m512i g)
 {
     constexpr int s0 = row_shift<bits, hb, row>(0) % 8 - delta;
     constexpr int s1 = row_shift<bits, hb, row>(8) % 8 - delta;
@@ -1133,11 +1139,10 @@ inline __m512i shift_mask_row(__m512i g)
             _mm512_srli_epi32(g, s0), _mm512_srli_epi32(g, s1)), _mm512_set1_epi32(0xffff));
 }
 
-// stride: the accumulator array's inner extent (MAX_M for the batched bands, rows for the
-// one-row decode band, which keeps its accumulators in registers)
+// stride: the accumulator array's inner extent.
 template <int bits, bool hb, int rows, int band, int P, int stride>
 M1_TARGET_VBMI
-inline void vbmi_band_rows
+M1_ALWAYS_INLINE void vbmi_band_rows
 (
     __m512i p0, __m512i p1, __m512i p2, __m512i p3, int b, const int32_t* splat, int k,
     __m512i (&acc)[band][stride]
@@ -1161,12 +1166,39 @@ inline void vbmi_band_rows
         }
         const __m512i prod0 = _mm512_mullo_epi32(c0, mult);
         const __m512i prod1 = _mm512_mullo_epi32(c1, mult);
-        for (int i = 0; i < rows; ++i)
+        // MSVC leaves the row loop rolled, spilling its accumulators for every pair
+        // of k terms. Specialize the rows and inline the entire extraction chain.
+        if constexpr (rows == 1)
         {
-            acc[b][i] = _mm512_dpbusd_epi32(acc[b][i], prod0,
-                _mm512_set1_epi32(splat[static_cast<size_t>(i) * k + R]));
-            acc[b][i] = _mm512_dpbusd_epi32(acc[b][i], prod1,
-                _mm512_set1_epi32(splat[static_cast<size_t>(i) * k + R + 1]));
+            // Retain the loop form for one row: MSVC otherwise hoists all pair
+            // products together, spilling vectors instead of consuming each pair.
+            for (int i = 0; i < rows; ++i)
+            {
+                acc[b][i] = _mm512_dpbusd_epi32(acc[b][i], prod0,
+                    _mm512_set1_epi32(splat[static_cast<size_t>(i) * k + R]));
+                acc[b][i] = _mm512_dpbusd_epi32(acc[b][i], prod1,
+                    _mm512_set1_epi32(splat[static_cast<size_t>(i) * k + R + 1]));
+            }
+        }
+        else
+        {
+            acc[b][0] = _mm512_dpbusd_epi32(acc[b][0], prod0, _mm512_set1_epi32(splat[R]));
+            acc[b][0] = _mm512_dpbusd_epi32(acc[b][0], prod1, _mm512_set1_epi32(splat[R + 1]));
+        }
+        if constexpr (rows >= 2)
+        {
+            acc[b][1] = _mm512_dpbusd_epi32(acc[b][1], prod0, _mm512_set1_epi32(splat[k + R]));
+            acc[b][1] = _mm512_dpbusd_epi32(acc[b][1], prod1, _mm512_set1_epi32(splat[k + R + 1]));
+        }
+        if constexpr (rows >= 3)
+        {
+            acc[b][2] = _mm512_dpbusd_epi32(acc[b][2], prod0, _mm512_set1_epi32(splat[2 * k + R]));
+            acc[b][2] = _mm512_dpbusd_epi32(acc[b][2], prod1, _mm512_set1_epi32(splat[2 * k + R + 1]));
+        }
+        if constexpr (rows >= 4)
+        {
+            acc[b][3] = _mm512_dpbusd_epi32(acc[b][3], prod0, _mm512_set1_epi32(splat[3 * k + R]));
+            acc[b][3] = _mm512_dpbusd_epi32(acc[b][3], prod1, _mm512_set1_epi32(splat[3 * k + R + 1]));
         }
         vbmi_band_rows<bits, hb, rows, band, P + 1>(p0, p1, p2, p3, b, splat, k, acc);
     }
@@ -1200,7 +1232,7 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
     constexpr __mmask16 mask2 = ld_mask(words32 - 32);
     constexpr __mmask16 mask3 = ld_mask(words32 - 48);
 
-    __m512i acc[band][MAX_M];
+    __m512i acc[band][rows];
     for (int b = 0; b < band; ++b)
         for (int i = 0; i < rows; ++i)
             acc[b][i] = _mm512_setzero_si512();
@@ -2769,14 +2801,14 @@ struct DecodeScratch
     std::vector<int32_t> splat_g, splat_u, splat_d, dup_g, dup_u, dup_d;
     PreparedIn pg{}, pu{}, pd{};
 
-    // One token row, which may take two GEMV rows (wide)
+    // A small token batch; each token may take two GEMV rows (wide).
     static DecodeScratch& get(int H, int I)
     {
         static thread_local DecodeScratch s;
         auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-        grow(s.tin_g, H); grow(s.tin_u, H);
-        grow(s.splat_g, 2 * H); grow(s.splat_u, 2 * H); grow(s.splat_d, 2 * I);
-        grow(s.dup_g, 2 * H); grow(s.dup_u, 2 * H); grow(s.dup_d, 2 * I);
+        grow(s.tin_g, MAX_SLOTS * H); grow(s.tin_u, MAX_SLOTS * H);
+        grow(s.splat_g, MAX_SLOTS * H); grow(s.splat_u, MAX_SLOTS * H); grow(s.splat_d, MAX_SLOTS * I);
+        grow(s.dup_g, MAX_SLOTS * H); grow(s.dup_u, MAX_SLOTS * H); grow(s.dup_d, MAX_SLOTS * I);
         s.pg.tin = s.tin_g.data(); s.pg.splat32 = s.splat_g.data(); s.pg.splat_dup = s.dup_g.data();
         s.pu.tin = s.tin_u.data(); s.pu.splat32 = s.splat_u.data(); s.pu.splat_dup = s.dup_u.data();
         s.pd.splat32 = s.splat_d.data(); s.pd.splat_dup = s.dup_d.data();
@@ -2804,11 +2836,17 @@ void decode_gu_block(ForwardCtx& c, int j, int block)
     const bool gated = !L.gates.empty();
     float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * I;
     float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I;
-    if (gated) transform_out_block(L.gates[e], g, block);
-    transform_out_block(L.ups[e], u, block);
-    apply_activation(L, g + block, u + block, 128);
-    const float* a = gated ? g : u;
-    prepare_block_avx2(a + block, false, L.downs[e].suh + block, c.prep_d[j].tin + block, 128);
+    for (int r = 0; r < c.chunks[j].m; ++r)
+    {
+        float* gr = g + static_cast<size_t>(r) * I;
+        float* ur = u + static_cast<size_t>(r) * I;
+        if (gated) transform_out_block(L.gates[e], gr, block);
+        transform_out_block(L.ups[e], ur, block);
+        apply_activation(L, gr + block, ur + block, 128);
+        const float* a = gated ? gr : ur;
+        prepare_block_avx2(a + block, false, L.downs[e].suh + block,
+                          c.prep_d[j].tin + static_cast<size_t>(r) * I + block, 128);
+    }
 }
 
 // Down block complete for every chunk: output transform and routing-weighted accumulate, chunks
@@ -2825,14 +2863,13 @@ void decode_out_block(ForwardCtx& c, int block, bool fold)
         const MoeCpuMatrix& mat = L.downs[ch.expert];
         float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
         if (fold) fold_rows(d, c.prep_d[j], ch.m, H, block, block + 128);
-        // Normally m == 1 here; retain repeated selections of the same expert
-        // too, which the raw API groups into a multi-row chunk.
+        // Every worker owns whole column blocks across all token rows.
         for (int r = 0; r < ch.m; ++r)
         {
             float* v = d + static_cast<size_t>(r) * H;
             transform_out_block(mat, v, block);
             for (int col = 0; col < 128; ++col)
-                c.out[block + col] += ch.weight[r] * v[block + col];
+                c.out[static_cast<size_t>(ch.token[r]) * H + block + col] += ch.weight[r] * v[block + col];
         }
     }
 }
@@ -2959,7 +2996,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
     }
 }
 
-// Single-token decode in two dispatches, gate/up and down (see exl3_moe_cpu_forward_raw).
+// Small-batch decode in two dispatches, gate/up and down (see exl3_moe_cpu_forward_raw).
 // Splitting the five-phase schedule into separate preparation phases handed every prepared
 // input from the worker that wrote it to all the workers that read it, and most of those
 // phases' time went to moving cache lines between cores rather than to arithmetic. Here
@@ -3040,7 +3077,7 @@ void decode_phase(void* vctx, int worker, int num_workers)
             PreparedIn& p = up ? s.pu : s.pg;
             if (prep_j[up] != j)
             {
-                prepare_rows(mat, c.x, nullptr, H, ch.token, 1, p);
+                prepare_rows(mat, c.x, nullptr, H, ch.token, ch.m, p);
                 prep_j[up] = j;
             }
             float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j) * MAX_SLOTS * I;
@@ -3055,7 +3092,7 @@ void decode_phase(void* vctx, int worker, int num_workers)
                 if (c.grp_done_gu[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
                 finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, p, tout, I, b * 8);
             }
-            fold_rows(tout, p, 1, I, b * 128, b * 128 + 128);
+            fold_rows(tout, p, ch.m, I, b * 128, b * 128 + 128);
             if (c.blk_done[j * nb + b].fetch_add(1, std::memory_order_acq_rel) == gu - 1)
                 decode_gu_block(c, j, b * 128);
         });
@@ -3075,7 +3112,10 @@ void decode_phase(void* vctx, int worker, int num_workers)
             if (prep_j != j)
             {
                 s.pd.tin = c.prep_d[j].tin;
-                s.pd.rows = quantize_row(s.pd.tin, I, s.pd, 0, 0);
+                int slot = 0;
+                for (int r = 0; r < ch.m; ++r)
+                    slot = quantize_row(s.pd.tin + static_cast<size_t>(r) * I, I, s.pd, r, slot);
+                s.pd.rows = slot;
                 prep_j = j;
             }
             float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
@@ -3090,7 +3130,7 @@ void decode_phase(void* vctx, int worker, int num_workers)
                 if (c.grp_done_d[gid].fetch_add(1, std::memory_order_acq_rel) != P - 1) return;
                 finish_partials(c.partials + static_cast<size_t>(gid) * P * 256, P, s.pd, tout, H, b * 8);
             }
-            fold_rows(tout, s.pd, 1, H, b * 128, b * 128 + 128);
+            fold_rows(tout, s.pd, ch.m, H, b * 128, b * 128 + 128);
             if (c.out_done[b].fetch_add(1, std::memory_order_acq_rel) == nc - 1)
                 decode_out_block(c, b * 128, false);
         });
@@ -3459,10 +3499,9 @@ void exl3_moe_cpu_forward_raw(
     static double phase_bytes[6] = {};
     static long prof_jobs = 0;
 
-    // Single-token decode runs as two dispatches (decode_phase). The five-phase schedule
-    // remains for the scalar tier and for repeated selections of one expert (multi-row chunks)
-    bool decode = rows == 1 && g_isa != Isa::Scalar;
-    for (const Chunk& ch : ctx.chunks) decode = decode && ch.m == 1;
+    // One- and two-token decode avoid the separate preparation/finish barriers.
+    // Larger batches retain the phase schedule that shares prepared inputs across workers.
+    const bool decode = rows <= 2 && g_isa != Isa::Scalar;
     if (decode)
     {
         const size_t num_blk = static_cast<size_t>(nc) * (I / 128);
@@ -3488,9 +3527,10 @@ void exl3_moe_cpu_forward_raw(
         bool ok_gu = true, ok_d = true;
         for (const Chunk& ch : ctx.chunks)
         {
-            ok_gu = ok_gu && split_k_ok(layer->ups[ch.expert])
+            // Split-K's partial buffer holds at most two quantized rows (one wide token).
+            ok_gu = ok_gu && ch.m == 1 && split_k_ok(layer->ups[ch.expert])
                           && (layer->gates.empty() || split_k_ok(layer->gates[ch.expert]));
-            ok_d = ok_d && split_k_ok(layer->downs[ch.expert]);
+            ok_d = ok_d && ch.m == 1 && split_k_ok(layer->downs[ch.expert]);
         }
         ctx.parts[0] = decode_parts(static_cast<int>(num_grp_gu), nw, ok_gu);
         ctx.parts[1] = decode_parts(static_cast<int>(num_grp_d), nw, ok_d);
@@ -3540,11 +3580,14 @@ void exl3_moe_cpu_forward_raw(
     if (prof && ++prof_jobs % 512 == 0)
     {
         printf(" -- moe_cpu prof (%ld jobs, us/job): prep_gu %.1f | gemv_gu %.1f (%.1f GB/s)"
-               " | act+prep_d %.1f | gemv_d %.1f (%.1f GB/s) | tf_d/finish %.1f | accum %.1f\n",
+               " | act+prep_d %.1f | gemv_d %.1f (%.1f GB/s) | tf_d/finish %.1f | accum %.1f"
+               " | wide prepared rows %lld/%lld\n",
                prof_jobs, phase_us[0] / prof_jobs, phase_us[1] / prof_jobs,
                phase_bytes[1] / phase_us[1] / 1000.0, phase_us[2] / prof_jobs,
                phase_us[3] / prof_jobs, phase_bytes[3] / phase_us[3] / 1000.0,
-               phase_us[4] / prof_jobs, phase_us[5] / prof_jobs);
+               phase_us[4] / prof_jobs, phase_us[5] / prof_jobs,
+               static_cast<long long>(g_prof_wide_rows.load(std::memory_order_relaxed)),
+               static_cast<long long>(g_prof_rows.load(std::memory_order_relaxed)));
         fflush(stdout);
     }
 }

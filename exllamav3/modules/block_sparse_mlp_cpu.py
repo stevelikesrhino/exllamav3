@@ -8,6 +8,10 @@ from ..ext import exllamav3_ext as ext
 # cudaMemcpyAsync path for A/B testing)
 _split_fused = os.environ.get("EXL3_MOE_SPLIT_FUSED", "1") != "0"
 
+# With one-token speculation, decode/verification has at most two rows. Keep long
+# prefills from dominating the placement profile when optimizing reasoning decode.
+_split_stats_decode_only = os.environ.get("EXL3_MOE_CPU_STATS_DECODE_ONLY", "0") == "1"
+
 # EXL3_SPLIT_PROF=1: CUDA-event brackets around the fused issue enqueue and the collect
 # wait+readback, reported as stream-time percentiles every ~2048 brackets. The collect
 # bracket is the true exposed stall: it runs after the GPU's own expert work, so any time
@@ -84,7 +88,7 @@ def save_expert_stats(infer_params):
     counts themselves are decayed, so the threshold is in decode steps, not hits"""
     import json, tempfile
     reg = getattr(infer_params, "moe_cpu_swap_modules", None)
-    if not reg or reg[0]._swap_tick_count < _STATS_MIN_STEPS:
+    if not reg or reg[0]._stats_step_count < _STATS_MIN_STEPS:
         return
     config, E = reg[0].config, reg[0].num_experts
     layers = _expert_stats_load(config, E)
@@ -490,8 +494,10 @@ class BlockSparseMLP_CPU:
             mp = [r if r < first - spares else first + (r - (first - spares)) for r in range(self.num_experts)]
             self._split_map = torch.tensor(mp, dtype = torch.long, device = dev)
             self._split_hist = torch.zeros(self.num_experts, dtype = torch.float, device = dev)
+            self._split_prefill_hist = torch.zeros_like(self._split_hist) if _split_stats_decode_only else None
             self._split_selcpu_t = None
             self._swap_tick_count = 0
+            self._stats_step_count = 0
             if spares:
                 self._split_mp = mp
                 self._split_free_gpu = list(range(first - spares, first))
@@ -524,6 +530,7 @@ class BlockSparseMLP_CPU:
                     reg.remove(self)
                 self._split_map = None
                 self._split_hist = None
+                self._split_prefill_hist = None
                 self._split_pending = None
                 self.config.infer_params.moe_cpu_promote_state = None
         if self.cpu_offload:
@@ -559,10 +566,12 @@ class BlockSparseMLP_CPU:
             # the worker compute and the readback) when no CPU expert was selected. Replaces
             # three cudaMemcpyAsync launches, the int32 cast and the pad per layer per step
             if _split_fused:
+                hist = self._split_hist if self._split_map is not None else None
+                if hist is not None and _split_stats_decode_only and bsz > 2:
+                    hist = self._split_prefill_hist
                 call = lambda: self.cpu_host.submit_issue_fused(
                     self.cpu_layer_idx, y, selected_experts, routing_weights,
-                    self._split_map,
-                    self._split_hist if self._split_map is not None else None,
+                    self._split_map, hist,
                     self.cpu_split_first)
                 pending = _sprof_wrap("issue", self.cpu_layer_idx, call) \
                     if _split_prof else call()
@@ -588,8 +597,9 @@ class BlockSparseMLP_CPU:
             buf = self._split_selcpu_t = torch.empty(
                 max(n, 64), dtype = torch.long, device = selected_experts.device)
         sel_cpu = buf[:n].view(selected_experts.shape)
+        hist = self._split_prefill_hist if _split_stats_decode_only and selected_experts.shape[0] > 2 else self._split_hist
         ext.moe_split_map(
-            selected_experts.view(-1), self._split_map, self._split_hist,
+            selected_experts.view(-1), self._split_map, hist,
             buf[:n], self.cpu_split_first)
         return sel_cpu
 
@@ -951,7 +961,9 @@ class BlockSparseMLP_CPU:
         if reg[0] is not self:
             return
         self._swap_tick_count += 1
-        if self._swap_tick_count % _STATS_SAVE_INTERVAL == 0:
+        # Sweeps reset their own timer, but must not reset the session's save timer.
+        self._stats_step_count += 1
+        if self._stats_step_count % _STATS_SAVE_INTERVAL == 0:
             save_expert_stats(ip)
         if self._split_spares:
             # Promote-on-miss replaces the sweep: one pass over every split module per step

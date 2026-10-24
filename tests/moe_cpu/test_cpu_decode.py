@@ -1,8 +1,8 @@
 """
-Single-token CPU MoE finishing (the decode-only fused finish) agrees with the batched path.
+One- and two-token CPU MoE finishing agrees with the larger-batch path.
 
 Exercises partial/empty routing, repeated expert selections, biases, and more workers than 128-column output
-blocks. Reference: the same layer run on the token twice (two-token batch), which keeps the separate transform
+blocks. Reference: the same layer run on the token batch three times, which keeps the separate transform
 and accumulation phases.
 """
 
@@ -17,7 +17,8 @@ pytestmark = pytest.mark.nogpu
 
 @pytest.mark.parametrize("activation", [0, 1, 2, 3])
 @pytest.mark.parametrize("bias", [False, True])
-def test_decode_finish_matches_batch(activation, bias, cpu_runtime):
+@pytest.mark.parametrize("rows", [1, 2])
+def test_decode_finish_matches_batch(activation, bias, rows, cpu_runtime):
     gen = torch.Generator().manual_seed(174)
     hidden, intermediate, experts = 384, 256, 3
     gated = activation != 2
@@ -45,16 +46,16 @@ def test_decode_finish_matches_batch(activation, bias, cpu_runtime):
     handle = ext.exl3_moe_cpu_make_layer(
         *g[:3], *u[:3], *d[:3], g[3], u[3], d[3], activation, 1.0, int(swizzled))
     try:
-        x = torch.randn(1, hidden, generator = gen).half()
+        x = torch.randn(rows, hidden, generator = gen).half()
         for selected in ([0, 1, 2], [-1, 1, -1], [-1, -1, -1], [1, 1, 1]):
-            sel = torch.tensor([selected], dtype = torch.long)
-            weights = torch.tensor([[0.2, 0.3, 0.5]], dtype = torch.half)
-            reference = torch.empty(2, hidden)
-            ext.exl3_moe_cpu_forward(handle, x.repeat(2, 1), sel.repeat(2, 1),
-                                    weights.repeat(2, 1), reference, 1)
+            sel = torch.tensor([selected], dtype = torch.long).repeat(rows, 1)
+            weights = torch.tensor([[0.2, 0.3, 0.5]], dtype = torch.half).repeat(rows, 1)
+            reference = torch.empty(3 * rows, hidden)
+            ext.exl3_moe_cpu_forward(handle, x.repeat(3, 1), sel.repeat(3, 1),
+                                    weights.repeat(3, 1), reference, 1)
             for threads in (1, 4, 16):
-                out = torch.full((1, hidden), float("nan"))
+                out = torch.full((rows, hidden), float("nan"))
                 ext.exl3_moe_cpu_forward(handle, x, sel, weights, out, threads)
-                torch.testing.assert_close(out[0], reference[0], rtol = 5e-4, atol = 2e-5)
+                torch.testing.assert_close(out, reference[:rows], rtol = 5e-4, atol = 2e-5)
     finally:
         ext.exl3_moe_cpu_free_layer(handle)

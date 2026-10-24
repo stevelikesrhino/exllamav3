@@ -163,15 +163,19 @@ def test_tuning_explicit_threads_wins(monkeypatch):
     assert mch.MoeCpuTuning().threads == 3
 
 
-def test_host_affinity_applied_once_per_process(fresh_host_affinity, capsys):
+def test_host_affinity_replans_for_larger_pool(fresh_host_affinity, monkeypatch, capsys):
     mch._apply_host_affinity(threads = 3, host_cores = 1)
     mch._apply_host_affinity(threads = 3, host_cores = 1)      # MTP head / draft / reload
-    mch._apply_host_affinity(threads = 4, host_cores = 1)      # wider later host: notice only
-    assert fresh_host_affinity == [[6, 7]]
+    monkeypatch.setattr(mch, "process_cpus", lambda: [6, 7])
+    mch._apply_host_affinity(threads = 4, host_cores = 1)
+    mch._apply_host_affinity(threads = 6, host_cores = 1)
+    mch._apply_host_affinity(threads = 3, host_cores = 1)      # keep clear of the larger pool
+    assert fresh_host_affinity == [[6, 7], [1, 3, 5, 7], [5, 7]]
     assert mch._HOST_ORIG_CPUS == list(range(8))
+    assert mch._HOST_AFFINITY_THREADS == 6
     out = capsys.readouterr().out
     assert "host on LPs [6, 7]" in out
-    assert "planned for 3 workers" in out
+    assert "host on LPs [5, 7]" in out
 
 
 def test_host_affinity_disabled_does_not_pin(fresh_host_affinity):
@@ -184,7 +188,7 @@ def test_host_affinity_os_failure_leaves_host_unpinned(fresh_host_affinity, monk
     monkeypatch.setattr(mch, "apply_process_affinity", lambda cpus: "denied")
     mch._apply_host_affinity(threads = 3, host_cores = 1)
     assert mch._HOST_ORIG_CPUS is None
-    assert "!! CPU MoE host affinity: denied; host threads left unpinned" in capsys.readouterr().out
+    assert "!! CPU MoE host affinity: denied; host affinity unchanged" in capsys.readouterr().out
 
 
 def test_spawn_hands_pre_pin_mask_to_worker(monkeypatch):

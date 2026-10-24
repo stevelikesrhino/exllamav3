@@ -442,6 +442,10 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     def unload(self):
+        # Main and MTP components can share the placement registry. Save before
+        # removing any module, even when another component owns the step counter.
+        from ..modules.block_sparse_mlp_cpu import save_expert_stats
+        save_expert_stats(self.config.infer_params)
         for module in self.modules:
             module.unload()
         # The loader's open slab blocks must not outlive the tensors sliced from them
