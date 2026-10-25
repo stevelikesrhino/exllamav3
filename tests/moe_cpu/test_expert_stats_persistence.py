@@ -21,7 +21,7 @@ def make_module(tmp_path):
     m._split_perm = [2, 0, 3, 1]
     m._split_spares = 0
     m._swap_tick_count = 0
-    m._stats_step_count = 0
+    m._split_step_count = 0
     return m
 
 
@@ -42,7 +42,7 @@ def test_periodic_save_survives_sweep_resets(tmp_path, monkeypatch):
     m = make_module(tmp_path)
     saved = []
     monkeypatch.setattr(bsm_cpu, "_STATS_SAVE_INTERVAL", 4)
-    monkeypatch.setattr(bsm_cpu, "save_expert_stats", lambda ip: saved.append(m._stats_step_count))
+    monkeypatch.setattr(bsm_cpu, "save_expert_stats", lambda ip: saved.append(m._split_step_count))
     for i in range(8):
         m._split_swap_tick()
         if i % 2 == 1:
@@ -68,7 +68,7 @@ def test_main_unload_saves_before_shared_mtp_registry_loses_layers(tmp_path, mon
     monkeypatch.setattr(bsm_cpu, "EXPERT_STATS_DIR", str(tmp_path))
     draft = make_module(tmp_path)
     draft.key = "mtp.layers.0.mlp"
-    draft._stats_step_count = bsm_cpu._STATS_MIN_STEPS
+    draft._split_step_count = bsm_cpu._STATS_MIN_STEPS
     main = make_module(tmp_path)
     main.config = draft.config
     registry = draft.config.infer_params.moe_cpu_swap_modules
